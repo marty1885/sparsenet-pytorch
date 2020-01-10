@@ -74,7 +74,7 @@ for i, (data, real_label) in enumerate(test_loader):
 
     criterion = Misclassification()
     attack = DeepFoolAttack(fbmodel, criterion)
-    #attack = (fbmodel, criterion)
+    #attack = SinglePixelAttack(fbmodel, criterion)
     #attack = EADAttack(fbmodel, criterion, distance=foolbox.distances.Linfinity)
     image = data.numpy()
     adversarial = attack(image, labels=label.numpy())

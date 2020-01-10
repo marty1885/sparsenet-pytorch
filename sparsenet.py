@@ -8,29 +8,31 @@ from torchvision import datasets, transforms
 
 class KWinner(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, density, factor=None):
-        top_ignore = 0
+    def forward(ctx, x, density, training, factor=None):
+        batch_size = x.shape[0]
         assert(len(x.shape) == 2)
         assert(0.0 < density < 1.0)
 
-        batch_size = x.shape[0]
+        #print(training)
 
         xp = x if factor is None else x*factor
-        k = int(x.shape[1]*density+top_ignore)
+        k = int(x.shape[1]*density)
         v, _ = xp.topk(k, sorted=True, dim=1)
         mask = (xp >= v[:,k-1].reshape(batch_size, 1)).float() #a mask for the inhibited variable
         #mask2 = (xp <= v[:,top_ignore-1].reshape(batch_size, 1)).float()
         mask = mask#*mask2
-        #stddev, mean = 0.1, 0
-        res = x * mask # + (1-mask.float())*torch.cuda.FloatTensor(*x.shape).normal_(mean, stddev)
 
-        ctx.save_for_backward(mask)
+        stddev, mean = 0.08, 0
+        noise = torch.cuda.FloatTensor(*x.shape).normal_(mean, stddev)
+
+        res = x * mask + (1-mask)*noise
+        ctx.save_for_backward(mask, noise)
         return res, mask
 
     @staticmethod
     def backward(ctx, grad_output, _):
-        mask, = ctx.saved_tensors
-        res = grad_output * mask.float()
+        mask, noise = ctx.saved_tensors
+        res = grad_output * mask + (1-mask)*grad_output*noise
         #res = grad_output
         return res, None, None, None
 
@@ -40,20 +42,19 @@ class k_winners2d(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, density):
         batch_size = x.shape[0]
+        channels = x.shape[1]
 
-        k = int(density*x.shape[1]*x.shape[2]*x.shape[3])
+        k = int(density*x.shape[2]*x.shape[3])
 
-        xr = x.reshape((batch_size, -1))
-        res = torch.zeros_like(x)
-        v, indices = xr.topk(k, dim=1, sorted=True)
-        mask = (xr >= v[:,k-1].view(-1, 1)) #a mask for the inhibited variable
+        v, indices = x.view(batch_size, channels, -1).topk(k, dim=2, sorted=True)
+        threshold = v[:,:,k-1].reshape(batch_size, channels, 1, 1)
+        mask = (x >= threshold).float() #a mask for the inhibited variable
         #av = xr[mask]
         #mean, stddev = xr.mean(), xr.std()
-        res = xr * mask.float() #+ (1-mask.float())*torch.cuda.FloatTensor(*xr.shape).normal_(mean, stddev)
-        res = res.reshape(x.shape)
-        mask = mask.reshape(x.shape)
-
-        ctx.save_for_backward(indices)
+        stddev, mean = 0.08, 0
+        noise = torch.cuda.FloatTensor(*x.shape).normal_(mean, stddev)
+        res = x * mask + (1-mask)*noise*x
+        ctx.save_for_backward(mask, noise)
         return res, mask
 
 
@@ -64,12 +65,8 @@ class k_winners2d(torch.autograd.Function):
         for the others.
         """
         batchSize = grad_output.shape[0]
-        indices, = ctx.saved_tensors
-
-        g = grad_output.reshape((batchSize, -1))
-        grad_x = torch.zeros_like(g, requires_grad=False)
-        grad_x.scatter_(1, indices, g.gather(1, indices))
-        grad_x = grad_x.reshape(grad_output.shape)
+        mask, noise = ctx.saved_tensors
+        grad_x = mask*grad_output + (1-mask)*grad_output*noise
 
         return grad_x, None, None, None
 kwinner2d = k_winners2d.apply
@@ -83,16 +80,19 @@ class KWinnerLayer(nn.Module):
 
     def forward(self, x):
         res = None
-        if self.boost_factor != 0 and self.training:
+        update_cycle = 1000
+        batch_size = x.shape[0]
+        if self.boost_factor != 0:
             factor = torch.exp((self.density - self.active_average)*self.boost_factor)
             factor = factor.detach()
-            res, mask = kwinner(x, self.density, factor)
+            res, mask = kwinner(x, self.density, self.training, factor)
+
+            if self.training:
+                self.active_average = nn.Parameter((1-batch_size/update_cycle)*self.active_average
+                    + mask.sum(0)/update_cycle)
+
         else:
-            res, mask = kwinner(x, self.density)
-
-        if self.boost_factor != 0 and self.training:
-            self.active_average = nn.Parameter(0.999*self.active_average + mask.float().mean(0)*0.001)
-
+            res, mask = kwinner(x, self.density, self.training, None)
         return res
 
 class KWinnerLayer2D(nn.Module):
@@ -100,22 +100,24 @@ class KWinnerLayer2D(nn.Module):
         super(KWinnerLayer2D, self).__init__()
         self.density = density
         self.boost_factor = boost_factor
-        self.average_activation = nn.Parameter(torch.zeros([channels] + list(input_shape))
+        self.active_average = nn.Parameter(torch.zeros([channels] + list(input_shape))
         	, requires_grad=False)
 
     def forward(self, x):
         res = None
+        update_cycle = 1000
+        batch_size = x.shape[0]
         if self.boost_factor != 0:
             #Input boosting
-            factor = torch.exp((self.density - self.average_activation)*self.boost_factor)
+            factor = torch.exp((self.density - self.active_average)*self.boost_factor)
             factor = factor.detach()
             res, mask = kwinner2d(x*factor, self.density)
+
+            if self.training:
+                self.active_average = nn.Parameter((1-batch_size/update_cycle)*self.active_average
+                    + mask.mean(0)/update_cycle)
         else:
             res, mask = kwinner2d(x, self.density)
-
-        if self.boost_factor != 0 and self.training:
-            self.average_activation = nn.Parameter(self.average_activation*0.999+mask.float().mean(0)*0.001)
-
         return res
 
 class b_relu(torch.autograd.Function):
@@ -143,7 +145,7 @@ class BRelu(nn.Module):
         self.t = t
 
     def forward(self, x):
-        return x#b_relu(x, self.t)
+        return brelu(x, self.t)
 
 class Net(nn.Module):
     def __init__(self):
@@ -154,8 +156,10 @@ class Net(nn.Module):
         self.fc1 = nn.Linear(120, 64)
         self.fc2 = nn.Linear(64, 10)
 
-        self.kw1 = KWinnerLayer(120, 0.06, 2.5)
-        self.kw2 = KWinnerLayer(64, 0.08, 2.5)
+        self.kw2d1 = KWinnerLayer2D((4, 4), 16, 0.2, 2)
+
+        self.kw1 = KWinnerLayer(120, 0.06, 2)
+        self.kw2 = KWinnerLayer(64, 0.08, 2)
         
 
     def forward(self, x):
@@ -163,10 +167,11 @@ class Net(nn.Module):
         x = F.max_pool2d(x, 2, 2)
         x = brelu(self.conv2(x))
         x = F.max_pool2d(x, 2, 2)
+        x = self.kw2d1(x)
         x = brelu(self.conv3(x))
         x = x.view(x.shape[0], -1)
         x = self.kw1(x)
-        x = self.fc1(x)
+        x = brelu(self.fc1(x))
         x = self.kw2(x)
         x = self.fc2(x)
         return F.softmax(x, dim=1)
@@ -191,7 +196,6 @@ class Lenet(nn.Module):
         x = self.fc1(x)
         x = brelu(x)
         x = self.fc2(x)
-        x = brelu(x)
         return F.softmax(x, dim=1)
         
 class LenetDropout(nn.Module):
@@ -216,5 +220,4 @@ class LenetDropout(nn.Module):
         x = brelu(x)
         x = F.dropout(x, 0.2)
         x = self.fc2(x)
-        x = brelu(x)
         return F.softmax(x, dim=1)
