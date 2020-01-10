@@ -98,8 +98,8 @@ def main():
     print("traning for {} epochs.".format(args.epochs))
     model = S.Net().to(device)
     #optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, nesterov=True)
-    optimizer = optim.RMSprop(model.parameters(), lr=args.lr, momentum=args.momentum)
-    #optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    #optimizer = optim.RMSprop(model.parameters(), lr=args.lr, momentum=args.momentum)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
     for epoch in range(1, args.epochs + 1):
         train(args, model, device, train_loader, optimizer, epoch)

@@ -8,21 +8,27 @@ from torchvision import datasets, transforms
 
 class KWinner(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, density):
+    def forward(ctx, x, density, factor=None):
+        top_ignore = 0
         assert(len(x.shape) == 2)
         assert(0.0 < density < 1.0)
 
-        k = int(x.shape[1]*density)
-        v, _ = x.topk(k, sorted=True)
+        batch_size = x.shape[0]
 
-        mask = (x >= v[:,k-1].view(-1, 1)) #a mask for the inhibited variable
-        res = x * mask.float()
+        xp = x if factor is None else x*factor
+        k = int(x.shape[1]*density+top_ignore)
+        v, _ = xp.topk(k, sorted=True, dim=1)
+        mask = (xp >= v[:,k-1].reshape(batch_size, 1)).float() #a mask for the inhibited variable
+        #mask2 = (xp <= v[:,top_ignore-1].reshape(batch_size, 1)).float()
+        mask = mask#*mask2
+        #stddev, mean = 0.1, 0
+        res = x * mask # + (1-mask.float())*torch.cuda.FloatTensor(*x.shape).normal_(mean, stddev)
 
         ctx.save_for_backward(mask)
-        return res
+        return res, mask
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output, _):
         mask, = ctx.saved_tensors
         res = grad_output * mask.float()
         #res = grad_output
@@ -41,15 +47,18 @@ class k_winners2d(torch.autograd.Function):
         res = torch.zeros_like(x)
         v, indices = xr.topk(k, dim=1, sorted=True)
         mask = (xr >= v[:,k-1].view(-1, 1)) #a mask for the inhibited variable
-        res = xr * mask.float()
+        #av = xr[mask]
+        #mean, stddev = xr.mean(), xr.std()
+        res = xr * mask.float() #+ (1-mask.float())*torch.cuda.FloatTensor(*xr.shape).normal_(mean, stddev)
         res = res.reshape(x.shape)
+        mask = mask.reshape(x.shape)
 
         ctx.save_for_backward(indices)
-        return res
+        return res, mask
 
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output, _):
         """
         In the backward pass, we set the gradient to 1 for the winning units, and 0
         for the others.
@@ -70,21 +79,19 @@ class KWinnerLayer(nn.Module):
         super(KWinnerLayer, self).__init__()
         self.density = density
         self.boost_factor = boost_factor
-        self.active_count = nn.Parameter(torch.zeros(input_shape), requires_grad=False)
-        self.inference_count = nn.Parameter(torch.zeros((1,)), requires_grad=False)
+        self.active_average = nn.Parameter(torch.ones(input_shape)*density, requires_grad=False)
 
     def forward(self, x):
         res = None
-        if self.boost_factor != 0 and self.inference_count != 0:
-            factor = torch.exp((self.density - self.active_count/self.inference_count)*self.boost_factor)
+        if self.boost_factor != 0 and self.training:
+            factor = torch.exp((self.density - self.active_average)*self.boost_factor)
             factor = factor.detach()
-            res = kwinner(x*factor, self.density)
+            res, mask = kwinner(x, self.density, factor)
         else:
-            res = kwinner(x, self.density)
+            res, mask = kwinner(x, self.density)
 
         if self.boost_factor != 0 and self.training:
-            self.active_count += (res != 0).float().mean(0)
-            self.inference_count += 1
+            self.active_average = nn.Parameter(0.999*self.active_average + mask.float().mean(0)*0.001)
 
         return res
 
@@ -93,23 +100,21 @@ class KWinnerLayer2D(nn.Module):
         super(KWinnerLayer2D, self).__init__()
         self.density = density
         self.boost_factor = boost_factor
-        self.active_count = nn.Parameter(torch.zeros([channels] + list(input_shape))
+        self.average_activation = nn.Parameter(torch.zeros([channels] + list(input_shape))
         	, requires_grad=False)
-        self.inference_count = nn.Parameter(torch.zeros((1,)), requires_grad=False)
 
     def forward(self, x):
         res = None
-        if self.boost_factor != 0 and self.inference_count != 0:
+        if self.boost_factor != 0:
             #Input boosting
-            factor = torch.exp((self.density - self.active_count/self.inference_count)*self.boost_factor)
+            factor = torch.exp((self.density - self.average_activation)*self.boost_factor)
             factor = factor.detach()
-            res = kwinner2d(x*factor, self.density)
+            res, mask = kwinner2d(x*factor, self.density)
         else:
-            res = kwinner2d(x, self.density)
+            res, mask = kwinner2d(x, self.density)
 
         if self.boost_factor != 0 and self.training:
-            self.active_count += (res != 0).float().mean(0)
-            self.inference_count += 1
+            self.average_activation = nn.Parameter(self.average_activation*0.999+mask.float().mean(0)*0.001)
 
         return res
 
@@ -130,8 +135,15 @@ class b_relu(torch.autograd.Function):
         alpha = alpha.item()
         res = mask*grad_output*alpha + (1-mask)*grad_output
         return res, None, None, None
-
 brelu = b_relu.apply
+
+class BRelu(nn.Module):
+    def __init__(self, t):
+        super(BRelu, self).__init__()
+        self.t = t
+
+    def forward(self, x):
+        return x#b_relu(x, self.t)
 
 class Net(nn.Module):
     def __init__(self):
@@ -142,21 +154,16 @@ class Net(nn.Module):
         self.fc1 = nn.Linear(120, 64)
         self.fc2 = nn.Linear(64, 10)
 
-        self.kw1 = KWinnerLayer(120, 0.06, 4.2)
-        self.kw2 = KWinnerLayer(64, 0.1, 4.2)
-        
-        self.kw3 = KWinnerLayer2D((24, 24), 6, 0.1, 4.2)
-        #self.kw4 = KWinnerLayer2D((8, 8), 16, 0.15, 4.2)
+        self.kw1 = KWinnerLayer(120, 0.06, 2.5)
+        self.kw2 = KWinnerLayer(64, 0.08, 2.5)
         
 
     def forward(self, x):
-        x = brelu(self.conv1(x), 4)
-        x = self.kw3(x)
+        x = brelu(self.conv1(x))
         x = F.max_pool2d(x, 2, 2)
-        x = brelu(self.conv2(x), 4)
-        #x = self.kw4(x)
+        x = brelu(self.conv2(x))
         x = F.max_pool2d(x, 2, 2)
-        x = brelu(self.conv3(x), 4)
+        x = brelu(self.conv3(x))
         x = x.view(x.shape[0], -1)
         x = self.kw1(x)
         x = self.fc1(x)
@@ -204,10 +211,10 @@ class LenetDropout(nn.Module):
         x = F.max_pool2d(x, 2, 2)
         x = F.relu(self.conv3(x), 4)
         x = x.view(x.shape[0], -1)
-        x = F.dropout(x, 0.4)
+        x = F.dropout(x, 0.2)
         x = self.fc1(x)
-        x = F.relu(x)
-        x = F.dropout(x, 0.4)
+        x = brelu(x)
+        x = F.dropout(x, 0.2)
         x = self.fc2(x)
-        x = F.relu(x)
+        x = brelu(x)
         return F.softmax(x, dim=1)

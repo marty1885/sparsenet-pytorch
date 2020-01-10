@@ -109,7 +109,7 @@ test_loader = torch.utils.data.DataLoader(
 
 # Run test for each epsilon
 for eps in epsilons:
-    acc, ex = test(model, device, test_loader, eps, 4)
+    acc, ex = test(model, device, test_loader, eps, 100)
     accuracies.append(acc)
     examples.append(ex)
 

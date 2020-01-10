@@ -16,14 +16,35 @@ print("IFGSM: Iterative Fast Gradient Signed Method")
 print("Attacking LeNet with IFGSM.")
 
 epsilons = [0, 0.003, .1, .15, .2, .25, .3]
-pretrained_model = "spaese_cnn.pt"
-use_cuda=True
+
+parser = argparse.ArgumentParser(description="Attach MNIST models")
+parser.add_argument('--no-cuda', action='store_true', default=False
+        , help='disable CUDA')
+parser.add_argument('--model-type', default='kwinner'
+        , help='The model type to attack')
+parser.add_argument('--num-iteration', type=int, default=100, metavar='N'
+        , help='The amount of iteratoins of attack')
+args = parser.parse_args()
 
 # Define what device we are using
+use_cuda = torch.cuda.is_available() and not args.no_cuda
 print("CUDA Available: ",torch.cuda.is_available())
 device = torch.device("cuda" if (use_cuda and torch.cuda.is_available()) else "cpu")
-model = S.Net().to(device)
 
+model_type = args.model_type
+if model_type == "dropout":
+    model = S.LenetDropout().to(device)
+    pretrained_model = "lenet_drop.pt"
+elif model_type == "lenet":
+    model = S.Lenet().to(device)
+    pretrained_model = "lenet.pt"
+elif model_type == "kwinner":
+    model = S.Net().to(device)
+    pretrained_model = "spaese_cnn.pt"
+else:
+    print("Model type must be drouput, lenet or kwinner.")
+    exit(0)
+num_iter = args.num_iteration
 model.load_state_dict(torch.load(pretrained_model, map_location='cpu'))
 model.train(False)
 model.eval()
@@ -110,7 +131,7 @@ test_loader = torch.utils.data.DataLoader(
 
 # Run test for each epsilon
 for eps in epsilons:
-    acc, ex = test(model, device, test_loader, eps, 4)
+    acc, ex = test(model, device, test_loader, eps, num_iter)
     accuracies.append(acc)
     examples.append(ex)
 
