@@ -91,6 +91,9 @@ def test( model, device, test_loader, epsilon, num_iter ):
             perturbed_data = fgsm_attack(data, epsilon/num_iter, data_grad)
             data = Variable(perturbed_data.data, requires_grad=True)
 
+            if epsilon == 0:
+                break
+
         # Re-classify the perturbed image
         output = model(perturbed_data)
         final_pred = np.argmax(output.detach().cpu().numpy(), axis=1).flatten() # get the index of the max log-probability

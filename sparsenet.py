@@ -6,55 +6,53 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torchvision import datasets, transforms
 
+import random
+
 class KWinner(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, density, training, factor=None):
+    def forward(ctx, x, density, training=True, factor=None):
+        top_ignore = 7
         batch_size = x.shape[0]
         assert(len(x.shape) == 2)
         assert(0.0 < density < 1.0)
 
-        #print(training)
-
         xp = x if factor is None else x*factor
-        k = int(x.shape[1]*density)
+        k = int(x.shape[1]*density)+top_ignore
         v, _ = xp.topk(k, sorted=True, dim=1)
-        mask = (xp >= v[:,k-1].reshape(batch_size, 1)).float() #a mask for the inhibited variable
-        #mask2 = (xp <= v[:,top_ignore-1].reshape(batch_size, 1)).float()
-        mask = mask#*mask2
-
-        stddev, mean = 0.08, 0
-        noise = torch.cuda.FloatTensor(*x.shape).normal_(mean, stddev)
-
-        res = x * mask + (1-mask)*noise
-        ctx.save_for_backward(mask, noise)
+        mask = (xp >= v[:,k-1].reshape(batch_size, 1)) #a mask for the inhibited variable
+        if top_ignore != 0:
+            mask2 = (xp <= v[:,top_ignore-1].reshape(batch_size, 1))
+        else:
+            mask2 = mask ## HACK
+        mask = (mask & mask2).float()
+        res = x * mask + (-x.mean(dim=0)*mask2.float())
+        if training:
+            pass
+        ctx.save_for_backward(mask)
         return res, mask
 
     @staticmethod
     def backward(ctx, grad_output, _):
-        mask, noise = ctx.saved_tensors
-        res = grad_output * mask + (1-mask)*grad_output*noise
-        #res = grad_output
+        mask, = ctx.saved_tensors
+        res = grad_output*mask
         return res, None, None, None
 
 kwinner = KWinner.apply
 
 class k_winners2d(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, density):
+    def forward(ctx, x, density, training=True, factor=None):
         batch_size = x.shape[0]
         channels = x.shape[1]
 
         k = int(density*x.shape[2]*x.shape[3])
 
-        v, indices = x.view(batch_size, channels, -1).topk(k, dim=2, sorted=True)
+        xp = (x if factor is None else x*factor)
+        v, indices = xp.view(batch_size, channels, -1).topk(k, dim=2, sorted=True)
         threshold = v[:,:,k-1].reshape(batch_size, channels, 1, 1)
-        mask = (x >= threshold).float() #a mask for the inhibited variable
-        #av = xr[mask]
-        #mean, stddev = xr.mean(), xr.std()
-        stddev, mean = 0.08, 0
-        noise = torch.cuda.FloatTensor(*x.shape).normal_(mean, stddev)
-        res = x * mask + (1-mask)*noise*x
-        ctx.save_for_backward(mask, noise)
+        mask = (xp >= threshold).float() #a mask for the inhibited variable
+        res = x * mask
+        ctx.save_for_backward(mask, None)
         return res, mask
 
 
@@ -64,9 +62,8 @@ class k_winners2d(torch.autograd.Function):
         In the backward pass, we set the gradient to 1 for the winning units, and 0
         for the others.
         """
-        batchSize = grad_output.shape[0]
         mask, noise = ctx.saved_tensors
-        grad_x = mask*grad_output + (1-mask)*grad_output*noise
+        grad_x = mask*grad_output + (((1-mask)*grad_output*noise) if noise is not None else 0)
 
         return grad_x, None, None, None
 kwinner2d = k_winners2d.apply
@@ -111,13 +108,13 @@ class KWinnerLayer2D(nn.Module):
             #Input boosting
             factor = torch.exp((self.density - self.active_average)*self.boost_factor)
             factor = factor.detach()
-            res, mask = kwinner2d(x*factor, self.density)
+            res, mask = kwinner2d(x, self.density, self.training, factor)
 
             if self.training:
                 self.active_average = nn.Parameter((1-batch_size/update_cycle)*self.active_average
-                    + mask.mean(0)/update_cycle)
+                    + mask.sum(0)/update_cycle)
         else:
-            res, mask = kwinner2d(x, self.density)
+            res, mask = kwinner2d(x, self.density, self.training, None)
         return res
 
 class b_relu(torch.autograd.Function):
@@ -125,10 +122,10 @@ class b_relu(torch.autograd.Function):
     def forward(ctx, x, t = 3, alpha = 0.1):
         l = x < 0
         r = x > t
-        mask = (l+r).sign()
+        mask = (l+r).sign().float()
 
         ctx.save_for_backward(mask, torch.FloatTensor([alpha]))
-        return l.float()*x*alpha + (1-mask).float()*x + r.float()*((x-t)*alpha+t)
+        return l.float()*x*alpha + (1-mask)*x + r.float()*((x-t)*alpha+t)
 
     @staticmethod
     def backward(ctx, grad_output):

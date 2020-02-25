@@ -14,7 +14,6 @@ import random
 import argparse
 
 import numpy as np
-import matplotlib.pyplot as plt
 
 import sparsenet as S
 
@@ -24,7 +23,7 @@ parser.add_argument('--no-cuda', action='store_true', default=False
 parser.add_argument('--model-type', default='kwinner'
         , help='The model type to attack')
 args = parser.parse_args()
-use_cuda=not args.no_cuda and torch.cuda.is_available()
+use_cuda=(not args.no_cuda) and torch.cuda.is_available()
 
 # Define what device we are using
 print("CUDA Available: ",use_cuda)
@@ -42,7 +41,7 @@ elif model_type == "kwinner":
 else:
     print("Model type must be drouput, lenet or kwinner.")
     exit(0)
-model.load_state_dict(torch.load(pretrained_model, map_location='cpu'))
+model.load_state_dict(torch.load(pretrained_model, map_location=device))
 model.train(False)
 model.eval()
 model = model.to(device)
@@ -73,9 +72,11 @@ for i, (data, real_label) in enumerate(test_loader):
         continue
 
     criterion = Misclassification()
-    attack = DeepFoolAttack(fbmodel, criterion)
-    #attack = SinglePixelAttack(fbmodel, criterion)
-    #attack = EADAttack(fbmodel, criterion, distance=foolbox.distances.Linfinity)
+    #attack = DeepFoolAttack(fbmodel, criterion) # Gradient Based
+    #attack = SinglePixelAttack(fbmodel, criterion) # Score based
+    #attack = EADAttack(fbmodel, criterion, distance=foolbox.distances.Linfinity) # Gradient Based
+    attack = AdamPGD(fbmodel, criterion, distance=foolbox.distances.Linfinity)
+    #attack = SaltAndPepperNoiseAttack(fbmodel, criterion)
     image = data.numpy()
     adversarial = attack(image, labels=label.numpy())
     adversarial = torch.Tensor(adversarial).to(device)

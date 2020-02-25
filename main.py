@@ -51,6 +51,7 @@ def test(args, model, device, test_loader, noise=0):
     print('Test set: Average loss: {:.4f}, Accuracy: {}/{} ({:.2f}%), noise={}\n'.format(
         test_loss, correct, len(test_loader.dataset),
         100. * correct / len(test_loader.dataset), noise))
+    return test_loss
 
 def main():
     # Training settings
@@ -104,12 +105,13 @@ def main():
     #optimizer = optim.RMSprop(model.parameters(), lr=args.lr, momentum=args.momentum)
     optimizer = optim.Adam(model.parameters(), lr=args.lr, amsgrad=True)
 
+    best_loss = 1e9
     for epoch in range(1, args.epochs + 1):
         train(args, model, device, train_loader, optimizer, epoch)
-        test(args, model, device, test_loader)
-
-    if (args.save_model):
-        torch.save(model.state_dict(),"spaese_cnn.pt")
+        loss = test(args, model.eval(), device, test_loader)
+        if loss < best_loss and args.save_model:
+            loss = best_loss
+            torch.save(model.state_dict(),"spaese_cnn.pt")
 
 
 #    """
