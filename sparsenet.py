@@ -10,32 +10,34 @@ import random
 
 class KWinner(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, density, training=True, factor=None):
-        top_ignore = 7
+    def forward(ctx, x, density, training=True, factor=None, top_ignore=4):
         batch_size = x.shape[0]
         assert(len(x.shape) == 2)
         assert(0.0 < density < 1.0)
+        assert(top_ignore >= 0)
 
         xp = x if factor is None else x*factor
-        k = int(x.shape[1]*density)+top_ignore
+        k = max(int(x.shape[1]*density), 1)+top_ignore
         v, _ = xp.topk(k, sorted=True, dim=1)
         mask = (xp >= v[:,k-1].reshape(batch_size, 1)) #a mask for the inhibited variable
+        res = None
+        combined_mask = None
         if top_ignore != 0:
             mask2 = (xp <= v[:,top_ignore-1].reshape(batch_size, 1))
+            combined_mask = (mask & mask2)
+            res = x*combined_mask + (-xp.mean(dim=0)*mask2) + (1-(mask | mask2).float())*density
         else:
-            mask2 = mask ## HACK
-        mask = (mask & mask2).float()
-        res = x * mask + (-x.mean(dim=0)*mask2.float())
-        if training:
-            pass
-        ctx.save_for_backward(mask)
+            res = x*mask
+            combined_mask = mask
+        
+        ctx.save_for_backward(combined_mask)
         return res, mask
 
     @staticmethod
     def backward(ctx, grad_output, _):
         mask, = ctx.saved_tensors
         res = grad_output*mask
-        return res, None, None, None
+        return res, None, None, None, None
 
 kwinner = KWinner.apply
 
@@ -69,11 +71,12 @@ class k_winners2d(torch.autograd.Function):
 kwinner2d = k_winners2d.apply
 
 class KWinnerLayer(nn.Module):
-    def __init__(self, input_shape, density, boost_factor = 0):
+    def __init__(self, input_shape, density, boost_factor = 0, top_ignore = 4):
         super(KWinnerLayer, self).__init__()
         self.density = density
         self.boost_factor = boost_factor
         self.active_average = nn.Parameter(torch.ones(input_shape)*density, requires_grad=False)
+        self.top_ignore = top_ignore
 
     def forward(self, x):
         res = None
@@ -82,7 +85,7 @@ class KWinnerLayer(nn.Module):
         if self.boost_factor != 0:
             factor = torch.exp((self.density - self.active_average)*self.boost_factor)
             factor = factor.detach()
-            res, mask = kwinner(x, self.density, self.training, factor)
+            res, mask = kwinner(x, self.density, self.training, factor, self.top_ignore)
 
             if self.training:
                 self.active_average = nn.Parameter((1-batch_size/update_cycle)*self.active_average
@@ -153,22 +156,22 @@ class Net(nn.Module):
         self.fc1 = nn.Linear(120, 64)
         self.fc2 = nn.Linear(64, 10)
 
-        self.kw2d1 = KWinnerLayer2D((4, 4), 16, 0.2, 2)
+        self.kw2d1 = KWinnerLayer2D((4, 4), 16, 0.2, 4)
 
-        self.kw1 = KWinnerLayer(120, 0.06, 2)
-        self.kw2 = KWinnerLayer(64, 0.08, 2)
+        self.kw1 = KWinnerLayer(120, 0.08, 4, top_ignore=14)
+        self.kw2 = KWinnerLayer(64, 0.12, 4, top_ignore=7)
         
 
     def forward(self, x):
-        x = brelu(self.conv1(x))
+        x = F.relu(self.conv1(x))
         x = F.max_pool2d(x, 2, 2)
-        x = brelu(self.conv2(x))
+        x = F.relu(self.conv2(x))
         x = F.max_pool2d(x, 2, 2)
         x = self.kw2d1(x)
-        x = brelu(self.conv3(x))
+        x = F.relu(self.conv3(x))
         x = x.view(x.shape[0], -1)
         x = self.kw1(x)
-        x = brelu(self.fc1(x))
+        x = F.relu(self.fc1(x))
         x = self.kw2(x)
         x = self.fc2(x)
         return F.softmax(x, dim=1)
@@ -189,6 +192,28 @@ class Lenet(nn.Module):
         x = F.relu(self.conv2(x), 4)
         x = F.max_pool2d(x, 2, 2)
         x = F.relu(self.conv3(x), 4)
+        x = x.view(x.shape[0], -1)
+        x = self.fc1(x)
+        x = F.relu(x)
+        x = self.fc2(x)
+        return F.softmax(x, dim=1)
+    
+class BreluLenet(nn.Module):
+    def __init__(self):
+        super(BreluLenet, self).__init__()
+        self.conv1 = nn.Conv2d(1, 6, 5, 1)
+        self.conv2 = nn.Conv2d(6, 16, 5, 1)
+        self.conv3 = nn.Conv2d(16, 120, 4, 1)
+        self.fc1 = nn.Linear(120, 64)
+        self.fc2 = nn.Linear(64, 10)
+
+
+    def forward(self, x):
+        x = brelu(self.conv1(x), 4)
+        x = F.max_pool2d(x, 2, 2)
+        x = brelu(self.conv2(x), 4)
+        x = F.max_pool2d(x, 2, 2)
+        x = brelu(self.conv3(x), 4)
         x = x.view(x.shape[0], -1)
         x = self.fc1(x)
         x = brelu(x)

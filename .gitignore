@@ -1,3 +1,5 @@
 __pycache__
 *.pt
 .vscode
+.ipynb_checkpoints
+*.csv
